@@ -72,7 +72,7 @@ class JoshuaError(Exception):
 
 
 # This is used to handle waiting for a given amount of time.
-class TimeoutFuture(object):
+class TimeoutFuture:
     def __init__(self, timeout):
         self.cb_list = []
         self.timer = threading.Timer(timeout, self._do_on_ready)
@@ -134,10 +134,12 @@ def trim_jobqueue(cutoff_date, remove_jobs=True):
 
 
 def log(outputText, newline=True):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message = f"[{timestamp}] {outputText}"
     return (
-        print(outputText, file=getFileHandle())
+        print(message, file=getFileHandle())
         if newline
-        else getFileHandle().write(outputText)
+        else getFileHandle().write(message)
     )
 
 
@@ -263,7 +265,7 @@ def tar_artifacts(ensemble, seed, sources, dest, work_dir=None):
         )
     try:
         # Create a temporary directory in the destination where we will store the results.
-        out_name = "joshua-run-{0}-{1}".format(ensemble, seed)
+        out_name = f"joshua-run-{ensemble}-{seed}"
         tmpdir = os.path.join(work_dir, out_name)
         os.makedirs(tmpdir)
 
@@ -413,7 +415,7 @@ class AsyncDone:
     def run(self, command, cwd, env):
         cmd_path = os.path.join(cwd, command[0])
         if not os.path.exists(cmd_path):
-            log("{} doesn't exist".format(cmd_path))
+            log(f"{cmd_path} doesn't exist")
             return
         process = subprocess.Popen(
             command,
@@ -528,7 +530,7 @@ class AsyncEnsemble:
         k8s_namespace_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
         if env.get('HOSTNAME', False) and os.path.isfile(k8s_namespace_file):
             pod_name = env['HOSTNAME']
-            with open(k8s_namespace_file, 'r') as f:
+            with open(k8s_namespace_file) as f:
                 namespace = f.read()
 
             # Get the cluster config
@@ -537,8 +539,11 @@ class AsyncEnsemble:
 
             # If last_test label is set to true, exit right away
             pod_desc = v1.read_namespaced_pod(pod_name, namespace)
-            if pod_desc.metadata.labels['last_test']:
-                raise JoshuaError("New agent scaler marked this pod to stop. Exiting.")
+            try:
+                if pod_desc.metadata.labels['last_test']:
+                    raise JoshuaError("New agent scaler marked this pod to stop. Exiting.")
+            except KeyError:
+                pass
 
             # Update the ensemble label
             if pod_desc.metadata.labels.get('ensemble', '') != ensemble:
@@ -551,7 +556,7 @@ class AsyncEnsemble:
         # Set environment variable to use the created temporary directory as its temporary directory.
         env["TMP"] = os.path.join(where, "tmp")
 
-        log("{} {} {}".format(ensemble, seed, command))
+        log(f"{ensemble} {seed} {command}")
 
         # Run the test and log output
         process = subprocess.Popen(
@@ -574,20 +579,52 @@ class AsyncEnsemble:
             try:
                 output, _ = process.communicate(timeout=1)
                 retcode = process.poll()
-                log("exit code: {}".format(retcode))
+                log(f"exit code: {retcode}")
                 # output = output.decode('utf-8')
 
                 break
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as timeout_ex:
+                # TimeoutExpired exception contains partial output
+                # captured before timeout. We must preserve this!
                 if self._cancelled():
                     log("<cancelled>")
                     retcode = -1
-                    output = b""
+                    # Preserve any stdout captured before cancellation
+                    output = timeout_ex.stdout if timeout_ex.stdout else b""
                     break
                 if timeout_time and time.time() > timeout_time:
                     log("<timed out>")
+                    # First try graceful shutdown with SIGTERM - gives Python's finally block time to execute
+                    process.terminate()
+                    try:
+                        # Wait up to 5 seconds for graceful shutdown
+                        remaining_out, remaining_err = process.communicate(timeout=5)
+                        log("Process terminated gracefully after SIGTERM")
+                    except subprocess.TimeoutExpired:
+                        # Still running after SIGTERM - force kill with SIGKILL
+                        log("Process didn't terminate after SIGTERM - sending SIGKILL")
+                        process.kill()
+                        remaining_out, remaining_err = process.communicate()
+
+                    # Combine partial output from timeout exception + remaining after terminate/kill
+                    output = (timeout_ex.stdout or b"") + (remaining_out or b"")
+                    log(f"Captured {len(output)} bytes on timeout (timeout_partial={len(timeout_ex.stdout or b'')}, post_terminate={len(remaining_out or b'')})")
+
+                    # If we got NO output at all (hung before test started), generate fallback XML
+                    if len(output) == 0 or output.strip() == b"":
+                        log("No output captured - test hung before producing any results. Generating fallback XML.")
+                        fallback_xml = (
+                            f'<Test TestFile="UNKNOWN" RandomSeed="UNKNOWN" BuggifyEnabled="UNKNOWN" '
+                            f'FaultInjectionEnabled="UNKNOWN" JoshuaSeed="{seed}" Ok="0" '
+                            f'CrashReason="HungBeforeExecution">'
+                            f'<JoshuaMessage Severity="40" Message="Test timed out without producing any output. '
+                            f'Container may have hung during tarball unpacking or before test command execution. '
+                            f'Seed={seed}"/></Test>'
+                        ).encode('utf-8')
+                        output = fallback_xml
+                        log(f"Generated fallback XML ({len(output)} bytes)")
+
                     retcode = -2
-                    output = b""
                     break
                 getFileHandle().write(".")
 
@@ -639,7 +676,7 @@ class AsyncEnsemble:
         try:
             i = 0
             while os.path.exists(to_write):
-                to_write = os.path.join(where, "tmp", "console-{0}.log".format(i))
+                to_write = os.path.join(where, "tmp", f"console-{i}.log")
                 i += 1
 
             with open(to_write, "wb") as fout:
@@ -776,6 +813,12 @@ def agent(
 
     start = time.time()  # Used later to limit time agent runs.
     idle_start = start  # Used to determine idle duration
+    agent_timeout_approaching = False  # Flag to indicate graceful shutdown mode
+    
+    if agent_timeout:
+        log(f"Joshua agent started with timeout: {agent_timeout} seconds")
+    else:
+        log("Joshua agent started with no timeout")
 
     try:
         # Run all of the sanity tests first, and if any of them fail, exit.
@@ -805,7 +848,7 @@ def agent(
         while True:
             # Break if the stop file is defined and present
             if stop_file and os.path.exists(stop_file):
-                log("Exiting due to existing stopfile: {}".format(stop_file))
+                log(f"Exiting due to existing stopfile: {stop_file}")
                 break
             # Break if requested
             if stopAgent():
@@ -882,7 +925,7 @@ def agent(
             # Throw away local state for ensembles that are no longer active
             local_ensemble_dirs = set(os.listdir(ensemble_dir(basepath=work_dir)))
             for e in (local_ensemble_dirs - set(ensembles)) - set(sanity_ensembles):
-                log("removing {} {}".format(e, ensemble_dir(e, basepath=work_dir)))
+                log(f"removing {e} {ensemble_dir(e, basepath=work_dir)}")
                 shutil.rmtree(
                     ensemble_dir(e, basepath=work_dir), True
                 )  # SOMEDAY: this sometimes throws errors, but we don't know why and it isn't that important
@@ -903,7 +946,7 @@ def agent(
                 try:
                     watch.wait_for_any(watch, sanity_watch, TimeoutFuture(1.0))
                 except Exception as e:
-                    log("watch error: {}".format(e))
+                    log(f"watch error: {e}")
                     watch = None
                     time.sleep(1.0)
 
@@ -913,12 +956,25 @@ def agent(
                     agent_idle_timeout is not None
                     and now - idle_start >= agent_idle_timeout
                 ):
-                    log("Agent timed out")
+                    log(f"Agent timed out after {now - start:.1f} seconds (no active ensembles)")
                     break
                 else:
                     continue
 
             assert ensembles_can_run
+
+            # Check if agent timeout is approaching - if so, finish gracefully
+            now = time.time()
+            if agent_timeout is not None and (now - start) >= agent_timeout:
+                if not agent_timeout_approaching:
+                    agent_timeout_approaching = True
+                    log(f"Agent timeout reached after {now - start:.1f} seconds - will exit gracefully after current job completes")
+                break
+
+            # Warn when timeout is approaching (5 minutes before)
+            if agent_timeout is not None and not agent_timeout_approaching and (now - start) >= (agent_timeout - 300):
+                log(f"Agent timeout approaching in {agent_timeout - (now - start):.0f} seconds")
+                agent_timeout_approaching = True
 
             # Pick an ensemble to run. Weight by amount of time spent on each one.
 
@@ -936,12 +992,15 @@ def agent(
                     chosen_ensemble = ensemble
                     break
             assert chosen_ensemble is not None
+            
+            log(f"Starting job from ensemble: {chosen_ensemble}")
             retcode = run_ensemble(
                 chosen_ensemble,
                 save_on,
                 work_dir=work_dir,
                 timeout_command_timeout=timeout_command_timeout,
             )
+            log(f"Completed job from ensemble: {chosen_ensemble}, result: {retcode}")
             # Exit agent gracefully via stopfile on probable zombie process
             if retcode == -1 or retcode == -2:
                 if stop_file is None:
@@ -1063,13 +1122,20 @@ if __name__ == "__main__":
     )
     arguments = parser.parse_args()
 
-    if arguments.apoptosis is not None:
+    # Check for AGENT_TIMEOUT environment variable first, then command line argument
+    agent_timeout_env = os.environ.get("AGENT_TIMEOUT", None)
+    if agent_timeout_env is not None:
+        agent_timeout = int(agent_timeout_env)
+        log(f"Using AGENT_TIMEOUT from environment: {agent_timeout} seconds")
+    elif arguments.apoptosis is not None:
         # Timeout is equal to the given argument with a random fuzz up to 50% of the argument.
         # This is added to avoid having 500+ Mesos boxes suddenly crying out in terror and
         # being suddenly silenced.
         agent_timeout = int(arguments.apoptosis * (1 + 0.5 * random.random()))
+        log(f"Using --apoptosis timeout: {agent_timeout} seconds")
     else:
         agent_timeout = None
+        log("No agent timeout configured - agent will run indefinitely")
 
     joshua_model.open(arguments.cluster_file, arguments.dir_path)
     agent_init(arguments.work_dir)

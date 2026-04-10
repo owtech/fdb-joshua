@@ -183,7 +183,7 @@ def is_message(text):
 
 def unwrap_message(text):
     root = ET.fromstring(text)
-    return root.getchildren()[0].attrib
+    return next(iter(root)).attrib
 
 
 def load_datetime(string):
@@ -224,7 +224,7 @@ def identify_existing_ensembles(tr, ensembles):
 
 
 @transactional
-def list_and_watch_active_ensembles(tr) -> Tuple[List[str], fdb.Future]:
+def list_and_watch_active_ensembles(tr) -> tuple[list[str], fdb.Future]:
     return _list_and_watch_ensembles(tr, dir_active, dir_active_changes)
 
 
@@ -258,7 +258,7 @@ def _unpack_property(ensemble, key, value, into):
         into[t[1]] = struct.unpack("<Q", value)[0]
 
 
-def _list_ensembles(tr, dir) -> List[Tuple[str, Dict]]:
+def _list_ensembles(tr, dir) -> list[tuple[str, dict]]:
     prop_reads = []
     for k, v in tr[dir.range()]:
         (ensemble,) = dir.unpack(k)
@@ -281,17 +281,17 @@ def _list_ensembles(tr, dir) -> List[Tuple[str, Dict]]:
 
 
 @transactional
-def list_active_ensembles(tr) -> List[Tuple[str, Dict]]:
+def list_active_ensembles(tr) -> list[tuple[str, dict]]:
     return _list_ensembles(tr, dir_active)
 
 
 @transactional
-def list_sanity_ensembles(tr) -> List[Tuple[str, Dict]]:
+def list_sanity_ensembles(tr) -> list[tuple[str, dict]]:
     return _list_ensembles(tr, dir_sanity)
 
 
-def list_all_ensembles() -> List[Tuple[str, Dict]]:
-    ensembles: List[Tuple[str, Dict]] = []
+def list_all_ensembles() -> list[tuple[str, dict]]:
+    ensembles: list[tuple[str, dict]] = []
     r = dir_all_ensembles.range()
     start = r.start
     tr = db.create_transaction()
@@ -405,7 +405,7 @@ def _create_ensemble(tr, ensemble_id, properties, sanity=False):
     dir, changes = get_dir_changes(sanity)
 
     if tr[dir_all_ensembles[ensemble_id]] != None:
-        print("{} already inserted".format(ensemble_id))
+        print(f"{ensemble_id} already inserted")
         return  # Already inserted
     tr[dir_all_ensembles[ensemble_id]] = b""
     for k, v in properties.items():
@@ -430,7 +430,10 @@ def create_ensemble(userid, properties, tarball, sanity=False, use_s3=False):
     else:
         hash = get_hash(tarball)
     timestamp = format_datetime(datetime.datetime.now(datetime.timezone.utc))
-    ensemble_id = timestamp + "-" + userid + "-" + hash[:16]
+    # Trim this because kubernetes labels are limited to 63 characters
+    # See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+    # So we use 15 + 1 + 27 + 1 + 16 = 60 here.
+    ensemble_id = timestamp + "-" + userid[:27] + "-" + hash[:16]
     if "submitted" not in properties:
         properties["submitted"] = timestamp
     if not use_s3:
@@ -455,7 +458,7 @@ def stop_user_ensembles(username, sanity=False):
 
 def get_active_ensembles(
     stopped, sanity=False, username=None
-) -> List[Tuple[str, Dict]]:
+) -> list[tuple[str, dict]]:
     if stopped:
         ensemble_list = list_all_ensembles()
     elif sanity:
@@ -633,6 +636,10 @@ def _increment(tr: fdb.Transaction, ensemble_id: str, counter: str) -> None:
     tr.add(dir_all_ensembles[ensemble_id]["count"][counter], ONE)
 
 
+def _decrement(tr: fdb.Transaction, ensemble_id: str, counter: str) -> None:
+    tr.add(dir_all_ensembles[ensemble_id]["count"][counter], struct.pack("<q", -1))
+
+
 def _add(tr: fdb.Transaction, ensemble_id: str, counter: str, value: int) -> None:
     byte_val = struct.pack("<Q", value)
     tr.add(dir_all_ensembles[ensemble_id]["count"][counter], byte_val)
@@ -648,7 +655,7 @@ def _get_snap_counter(tr: fdb.Transaction, ensemble_id: str, counter: str) -> in
 
 def _get_seeds_and_heartbeats(
     ensemble_id: str, tr: fdb.Transaction
-) -> List[Tuple[int, float]]:
+) -> list[tuple[int, float]]:
     result = []
     for k, v in tr.snapshot[dir_ensemble_incomplete[ensemble_id]["heartbeat"].range()]:
         (seed,) = dir_ensemble_incomplete[ensemble_id]["heartbeat"].unpack(k)
@@ -673,8 +680,17 @@ def should_run_ensemble(tr: fdb.Transaction, ensemble_id: str) -> bool:
     """
     props = _get_ensemble_properties(tr, ensemble_id)
     started = props.get("started", 0)
+    passed = props.get("pass", 0)
+    failed = props.get("fail", 0)
+    completed = passed + failed
     max_runs = props.get("max_runs", 0)
+    
     # max_runs == 0 means run forever
+    if max_runs > 0 and completed >= max_runs:
+        # Ensemble has reached its completion target, no more work needed
+        return False
+    
+    # Check if we're approaching the limit to avoid overshooting
     if max_runs > 0 and started >= max_runs:
         current_time = time.time()
         max_seed = None
@@ -694,6 +710,7 @@ def should_run_ensemble(tr: fdb.Transaction, ensemble_id: str) -> bool:
                 )
             )
 
+            _decrement(tr, ensemble_id, "started")
             # If we read at snapshot isolation then an arbitrary number of agents could steal this run/seed.
             # We only want one agent to succeed in taking over for the dead agent's run/seed.
             tr.add_read_conflict_key(
@@ -705,12 +722,12 @@ def should_run_ensemble(tr: fdb.Transaction, ensemble_id: str) -> bool:
             return True
         return False
     else:
-        # max_runs == 0 or started < max_runs
+        # max_runs == 0 or started < max_runs and completed < max_runs
         return True
 
 
 @transactional
-def show_in_progress(tr: fdb.Transaction, ensemble_id: str) -> List[Tuple[int, Dict]]:
+def show_in_progress(tr: fdb.Transaction, ensemble_id: str) -> list[tuple[int, dict]]:
     """
     Returns a list of properties for in progress tests
     """
@@ -742,7 +759,17 @@ def try_starting_test(tr, ensemble_id, seed, sanity=False) -> bool:
         # Don't run the same seed twice simultaneously
         return tr[dir_ensemble_incomplete[ensemble_id][seed]] == instanceid
 
+    props = _get_ensemble_properties(tr, ensemble_id)
+    started = props.get("started", 0)
+    max_runs = props.get("max_runs", 0)
+    if max_runs > 0 and started >= max_runs:
+        return False
+
+    # We read started and max_runs at serializable isolation, so we do have a
+    # read conflict on started, but atomic add will still have the effect we
+    # want
     _increment(tr, ensemble_id, "started")
+
     tr[dir_ensemble_incomplete[ensemble_id][seed]] = instanceid
     current_time = time.time()
     tr[dir_ensemble_incomplete[ensemble_id][seed]["began_at"]] = fdb.tuple.pack(
@@ -967,9 +994,9 @@ def tail_results(ensemble_id, errors_only=False, compressed=True):
                             )
                         else:
                             yield new_item
-                    except Exception as e:
+                    except Exception:
                         # Could not parse the message. Just yield the item.
-                        traceback.print_exc(e)
+                        traceback.print_exc()
                         yield new_item
                 else:
                     yield new_item

@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 
+# This script acts as a Kubernetes agent scaler for Joshua test jobs.
+# Its primary responsibilities are:
+# 1. Periodically cleaning up completed or failed Joshua agent jobs specific
+#    to the AGENT_NAME it's configured for (e.g., joshua-agent, joshua-rhel9-agent).
+# 2. Monitoring the queue of pending test ensembles (via /tools/ensemble_count.py).
+# 3. Provisioning new Joshua agent jobs of its configured AGENT_NAME type if there
+#    is demand and the total number of active Joshua jobs (of any type) in the
+#    namespace is below the global MAX_JOBS limit.
+# It uses kubectl for all Kubernetes interactions and is configured via
+# environment variables such as BATCH_SIZE, MAX_JOBS, CHECK_DELAY, AGENT_NAME,
+# FDB_CLUSTER_FILE, and AGENT_TAG (for the job template).
+#
+# This script is intended to work for joshua-agent and for joshua-rhel9-agent.
+
+# batch_size is how many joshua runs each pod instance is expected to do before the pod completes.
 batch_size=${BATCH_SIZE:-1}
 max_jobs=${MAX_JOBS:-10}
 check_delay=${CHECK_DELAY:-10}
@@ -10,9 +25,21 @@ restart_agents_on_boot=${RESTART_AGENTS_ON_BOOT:-false}
 
 namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
 
+# Default AGENT_NAME to "joshua-agent" if not set or empty
+# Its 'joshua-rhel9-agent' for rockylinux9 instances.
+export AGENT_NAME=${AGENT_NAME:-"joshua-agent"}
+
+# Scaling configuration for large test suites
+# For very large queues (>1000 ensembles), scale more aggressively
+# For smaller queues, use normal scaling to be fair to other users
+
 # if AGENT_TAG is not set through --build-arg,
 # use the default agent image and tag
 export AGENT_TAG=${AGENT_TAG:-"foundationdb/joshua-agent:latest"}
+
+# Path to the FoundationDB cluster file
+# This should be available within the pod, e.g., mounted from a ConfigMap
+export FDB_CLUSTER_FILE=${FDB_CLUSTER_FILE:-"/etc/foundationdb/fdb.cluster"}
 
 if [ $restart_agents_on_boot == true ]; then
     # mark existing jobs to exit after the current test completes
@@ -22,72 +49,206 @@ fi
 # run forever
 while true; do
 
+    # Build list of Failed jobs to protect (retain for 1 day for debugging)
+    # These jobs should NOT be deleted by the normal cleanup below
+    declare -A protected_failed_jobs
+    current_epoch=$(date +%s)
+    
+    kubectl get jobs -n "${namespace}" -o json 2>/dev/null | \
+      jq -r '.items[] | select(.status.conditions[]? | select(.type=="Failed" and .status=="True")) | .metadata.name + " " + .metadata.creationTimestamp' | \
+      { grep -E "^${AGENT_NAME}-[0-9]+(-[0-9]+)?" || true; } | \
+      while read -r job_name job_timestamp; do
+          if [[ -n "$job_name" ]] && [[ -n "$job_timestamp" ]]; then
+              # Calculate if job is less than 1 day old (should be protected)
+              job_epoch=$(date -d "$job_timestamp" +%s 2>/dev/null)
+              if [[ -n "$job_epoch" ]]; then
+                  job_plus_1day_epoch=$((job_epoch + 86400))
+                  if [[ "$job_plus_1day_epoch" -ge "$current_epoch" ]]; then
+                      # Job is less than 1 day old - protect it
+                      echo "$job_name"
+                  fi
+              fi
+          fi
+      done > /tmp/protected_failed_jobs_${AGENT_NAME}.txt
+    
+    # Load protected jobs into associative array for fast lookup
+    while read -r job_name; do
+        if [[ -n "$job_name" ]]; then
+            protected_failed_jobs["$job_name"]=1
+        fi
+    done < /tmp/protected_failed_jobs_${AGENT_NAME}.txt 2>/dev/null
+    
+    protected_count=${#protected_failed_jobs[@]}
+    if [[ "$protected_count" -gt 0 ]]; then
+        echo "$(date -Iseconds) === Protecting ${protected_count} failed job(s) less than 1 day old === (AGENT_NAME: ${AGENT_NAME})"
+    fi
+
     if [ $use_k8s_ttl_controller == false ] ; then
       # cleanup finished jobs (status 1/1)
-      for job in $(kubectl get jobs -n "${namespace}" --no-headers | grep -E -e 'joshua-agent-[0-9-]*\s*1/1' | awk '{print $1}'); do
-          echo "=== Job $job Completed ==="
+      # Filter by AGENT_NAME and check 3rd column for "1/1" (completions)
+      for job in $(kubectl get jobs -n "${namespace}" --no-headers | { grep -E -e "^${AGENT_NAME}-[0-9]+(-[0-9]+)?\\s" || true; } | awk '$3 == "1/1" {print $1}'); do
+          # Skip if this job is a protected failed job
+          if [[ -n "${protected_failed_jobs[$job]:-}" ]]; then
+              echo "=== Skipping protected failed job: $job === (AGENT_NAME: ${AGENT_NAME})"
+              continue
+          fi
+          echo "$(date -Iseconds) === Job $job Completed (1/1) - deleting from get jobs === (AGENT_NAME: ${AGENT_NAME})"
           kubectl delete job "$job" -n "${namespace}"
       done
 
-      # cleanup failed jobs
+      # cleanup failed/completed jobs by looking at pods for the current AGENT_NAME
       # pod name is always prefixed with the job name
-      # e.g. "joshua-agent-XXXXXXXXXXXX-XX-yyyyy"
-      for job in $(kubectl get pods -n "${namespace}" --no-headers | grep -E -e "Completed" -e "Error" | cut -f 1-4 -d '-') ; do
-          echo "=== Deleting Job $job ==="
-          kubectl delete job "$job" -n "${namespace}"
+      # e.g. "joshua-agent-XXXXXXXXXXXXXX-XX-yyyyy" or "joshua-rhel9-agent-XXXXXXXXXXXXXX-XX-yyyyy"
+      # Filter pods by AGENT_NAME first, then by status, then extract job prefix
+      # The number of fields to cut for the job prefix depends on the number of hyphens in AGENT_NAME itself, plus one for the timestamp part.
+      num_hyphen_fields_in_agent_name=$(echo "${AGENT_NAME}" | awk -F'-' '{print NF}')
+      job_prefix_fields=$((num_hyphen_fields_in_agent_name + 1))
+      for job_prefix_from_pod in $(kubectl get pods -n "${namespace}" --no-headers | { grep -E "^${AGENT_NAME}-[0-9]+(-[0-9]+)?-" || true; } | { grep -E -e "Completed" -e "Error" || true; } | cut -f 1-${job_prefix_fields} -d '-'); do
+          if [ -n "$job_prefix_from_pod" ]; then
+            # Validate that the derived job_prefix_from_pod actually matches the expected format for this agent's jobs
+            if [[ "${job_prefix_from_pod}" =~ ^${AGENT_NAME}-[0-9]+(-[0-9]+)?$ ]]; then
+              # Skip if this job is a protected failed job
+              if [[ -n "${protected_failed_jobs[$job_prefix_from_pod]:-}" ]]; then
+                  echo "=== Skipping protected failed job: $job_prefix_from_pod === (AGENT_NAME: ${AGENT_NAME})"
+                  continue
+              fi
+              echo "$(date -Iseconds) === Deleting Job based on pod status: $job_prefix_from_pod === (AGENT_NAME: ${AGENT_NAME})"
+              kubectl delete job "$job_prefix_from_pod" -n "${namespace}" --ignore-not-found=true
+            else
+              # This case can occur if AGENT_NAME is unusual (e.g., 'foo-bar' and a pod 'foo-bar-baz-TIMESTAMP-...' exists)
+              # or if the pod naming doesn't strictly follow AGENT_NAME-TIMESTAMP-SUFFIX.
+              # The initial grep on pods already ensures it starts with AGENT_NAME-TIMESTAMP_LIKE_PATTERN-,
+              # so this condition means the 'cut' command resulted in a prefix not matching AGENT_NAME-TIMESTAMP.
+              echo "=== WARNING: Pod for AGENT_NAME ${AGENT_NAME} yielded job prefix candidate '${job_prefix_from_pod}' that does not match expected pattern '^${AGENT_NAME}-[0-9]+(-[0-9]+)?$'. Skipping delete. ==="
+            fi
+          fi
       done
     fi
 
-    # get the current ensembles
-    num_ensembles=$(python3 /tools/ensemble_count.py)
-    echo "${num_ensembles} ensembles in the queue"
+    # Cleanup Failed jobs that are older than 1 day (no longer need protection for debugging)
+    kubectl get jobs -n "${namespace}" -o json 2>/dev/null | \
+      jq -r '.items[] | select(.status.conditions[]? | select(.type=="Failed" and .status=="True")) | .metadata.name + " " + .metadata.creationTimestamp' | \
+      { grep -E "^${AGENT_NAME}-[0-9]+(-[0-9]+)?" || true; } | \
+      while read -r job_name job_timestamp; do
+          if [[ -n "$job_name" ]] && [[ -n "$job_timestamp" ]]; then
+              # Calculate if job is older than 1 day
+              job_epoch=$(date -d "$job_timestamp" +%s 2>/dev/null)
+              if [[ -n "$job_epoch" ]]; then
+                  job_plus_1day_epoch=$((job_epoch + 86400))
+                  if [[ "$job_plus_1day_epoch" -lt "$current_epoch" ]]; then
+                      echo "$(date -Iseconds) === Deleting 1-day old failed job: $job_name === (AGENT_NAME: ${AGENT_NAME})"
+                      kubectl delete job "$job_name" -n "${namespace}" --ignore-not-found=true
+                  fi
+              fi
+          fi
+      done
+    
+    # Clean up temp file
+    rm -f /tmp/protected_failed_jobs_${AGENT_NAME}.txt
 
-    # get the current jobs
-    num_jobs=$(kubectl get jobs -n "${namespace}" --no-headers | wc -l)
-    echo "${num_jobs} jobs are running"
+    # Get the current ensembles
+    # Pass the cluster file to the ensemble_count.py script
+    if [ ! -f "${FDB_CLUSTER_FILE}" ]; then
+        echo "ERROR: FDB Cluster File ${FDB_CLUSTER_FILE} not found! Cannot count ensembles. Assuming 0."
+        num_ensembles=0
+    else
+        num_ensembles=$(python3 /tools/ensemble_count.py -C "${FDB_CLUSTER_FILE}")
+    fi
+    echo "$(date -Iseconds) ${num_ensembles} ensembles in the queue (global)"
 
-    # provision more jobs
-    if [ "${num_ensembles}" -gt "${num_jobs}" ]; then
+    # Calculate the number of all active Joshua jobs (any type) -- 'jobs' are effectively pod instances (a pod instance usually does batch_size joshua runs and then completes).
+    # Active jobs are those with .status.active > 0 (i.e., pods are running/pending but not yet succeeded/failed overall for the job)
+    num_all_active_joshua_jobs=$(kubectl get jobs -n "${namespace}" -o 'jsonpath={range .items[?(@.status.active > 0)]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -Ec '^joshua-(rhel9-)?agent-[0-9]+(-[0-9]+)?$')
+    echo "$(date -Iseconds) ${num_all_active_joshua_jobs} total active joshua jobs of any type that are running. Global max_jobs: ${max_jobs}."
+
+    new_jobs=0 # Initialize jobs to start this cycle for this scaler
+
+    # Provision more jobs if global ensembles exist and the global max_jobs limit is not reached.
+    if [ "${num_ensembles}" -gt 0 ] && [ "${num_all_active_joshua_jobs}" -lt "${max_jobs}" ]; then
         current_timestamp="$(date +%y%m%d%H%M%S)"
-        new_jobs=$((num_ensembles - num_jobs))
 
-        if [ ${new_jobs} -gt $((max_jobs - num_jobs)) ]; then
-            new_jobs=$((max_jobs - num_jobs))
+        # How many slots are available globally before hitting max_jobs
+        slots_available_globally=$((max_jobs - num_all_active_joshua_jobs))
+
+        # Determine how many jobs to create. The goal is to create enough jobs to
+        # process the entire queue, where each job is assumed to handle 'batch_size'
+        # ensembles. This is then capped by various limits.
+
+        # 1. Calculate the ideal number of jobs needed to clear the queue.
+        #    This is ceil(num_ensembles / batch_size).
+        if [ "${batch_size}" -gt 0 ]; then
+            num_to_attempt=$(( (num_ensembles + batch_size - 1) / batch_size ))
+        else
+            # Avoid division by zero; fall back to one job per ensemble if batch_size is 0.
+            num_to_attempt=${num_ensembles}
         fi
 
+        # 2. The number of new jobs cannot exceed the globally available slots.
+        if [ "${num_to_attempt}" -gt "${slots_available_globally}" ]; then
+            num_to_attempt=${slots_available_globally}
+        fi
+
+        # 3. The number of new jobs cannot exceed the per-cycle limit, if one is set.
+        # Simple scaling: 1000 jobs for very large queues, 100 for smaller queues
         if [ -n "${MAX_NEW_JOBS}" ]; then
-            if [ "${new_jobs}" -gt "${MAX_NEW_JOBS}" ]; then
-                new_jobs=${MAX_NEW_JOBS}
+            if [ "${num_ensembles}" -gt 1000 ]; then
+                # For very large queues (>1000), allow up to 1000 jobs per cycle
+                # This helps clear large test suites quickly while being fair
+                large_queue_limit=1000
+                if [ "${num_to_attempt}" -gt "${large_queue_limit}" ]; then
+                    num_to_attempt=${large_queue_limit}
+                fi
+            else
+                # For smaller queues, use normal MAX_NEW_JOBS to be fair to other users
+                if [ "${num_to_attempt}" -gt "${MAX_NEW_JOBS}" ]; then
+                    num_to_attempt=${MAX_NEW_JOBS}
+                fi
+            fi
+        fi
+
+        if [ "${num_to_attempt}" -gt 0 ]; then
+            new_jobs=${num_to_attempt}
+            if [ "${num_ensembles}" -gt 1000 ]; then
+                echo "Large queue detected: ${num_ensembles} ensembles, targeting ${new_jobs} new jobs (large queue mode)"
+            else
+                echo "Normal scaling: ${num_ensembles} ensembles, targeting ${new_jobs} new jobs"
             fi
         fi
 
         idx=0
-        echo "Starting ${new_jobs} jobs"
-        while [ $idx -lt ${new_jobs} ]; do
-            if [ -e /tmp/joshua-agent.yaml ]; then
-                rm -f /tmp/joshua-agent.yaml
-            fi
-            i=0
-            while [ $i -lt "${batch_size}" ]; do
-                export JOBNAME_SUFFIX="${current_timestamp}-${idx}"
-                echo "=== Adding $JOBNAME_SUFFIX ==="
-                envsubst </template/joshua-agent.yaml.template >>/tmp/joshua-agent.yaml
-                # add a separator
-                echo "---" >>/tmp/joshua-agent.yaml
-                ((idx++))
-                ((i++))
-                if [ "${idx}" -ge ${new_jobs} ]; then
-                    break
+        if [ "${new_jobs}" -gt 0 ]; then
+            echo "Starting ${new_jobs} jobs"
+            while [ $idx -lt ${new_jobs} ]; do
+                if [ -e /tmp/joshua-agent.yaml ]; then
+                    rm -f /tmp/joshua-agent.yaml
                 fi
+                i=0
+                while [ $i -lt "${batch_size}" ]; do
+                    export JOBNAME_SUFFIX="${current_timestamp}-${idx}"
+                    echo "=== Adding $JOBNAME_SUFFIX ==="
+                    envsubst </template/joshua-agent.yaml.template >>/tmp/joshua-agent.yaml
+                    # add a separator
+                    printf '\n---\n' >>/tmp/joshua-agent.yaml
+                    ((idx++))
+                    ((i++))
+                    if [ "${idx}" -ge ${new_jobs} ]; then
+                        break
+                    fi
+                done
+                # /tmp/joshua-agent.yaml contains up to $batch_size entries
+                echo "Starting ${i} jobs"
+                kubectl apply -f /tmp/joshua-agent.yaml -n "${namespace}"
             done
-            # /tmp/joshua-agent.yaml contains up to $batch_size entries
-            echo "Starting a batch of ${i} jobs"
-            kubectl apply -f /tmp/joshua-agent.yaml -n "${namespace}"
-        done
+        fi
     fi
-    echo "${new_jobs} jobs started"
+    # Standardized log message based on new_jobs calculated for this iteration for this agent type
+    echo "$(date -Iseconds) ${new_jobs} jobs of type ${AGENT_NAME} were targeted for starting in this iteration."
 
-    # check every check_delay seconds
-    sleep "${check_delay}"
+    # Use consistent check delay for all queue sizes
+    adaptive_delay=${check_delay}
+    
+    # check every adaptive_delay seconds
+    sleep "${adaptive_delay}"
 done
 exit 0
+
